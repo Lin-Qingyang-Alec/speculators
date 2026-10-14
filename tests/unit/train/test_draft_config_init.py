@@ -476,7 +476,10 @@ def test_build_from_config_only_reapplies_draft_attn_impl(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(monkeypatch):
+@pytest.mark.parametrize("speculator_type", ["mtp", "pmtp"])
+def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(
+    monkeypatch, speculator_type
+):
     """MTP without --from-pretrained reuses the verifier's own decoder config and
     must not synthesize a decoder or resolve a draft mask token."""
     verifier_cfg = object()
@@ -503,7 +506,7 @@ def test_build_draft_model_mtp_from_scratch_uses_verifier_decoder(monkeypatch):
             return "MTP_MODEL"
 
     args = SimpleNamespace(
-        speculator_type="mtp",
+        speculator_type=speculator_type,
         from_pretrained="",
         draft_config="",
         verifier_name_or_path="some-verifier",

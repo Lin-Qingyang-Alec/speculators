@@ -603,7 +603,16 @@ class MTPArgs(_Group):
     step_weight_beta: float = Field(
         default=0.6,
         description="Exponential decay factor for MTP step weights; higher weights "
-        "earlier prediction steps more. Only used with MTP.",
+        "earlier prediction steps more. Used with MTP and PMTP.",
+    )
+
+
+class PMTPArgs(_Group):
+    pmtp_max_anchors: int = Field(
+        default=32, ge=1, description="Maximum parallel MTP groups per packed sequence."
+    )
+    pmtp_logit_chunk_size: int = Field(
+        default=16, ge=1, description="Maximum PMTP token logits per loss chunk."
     )
 
 
@@ -625,6 +634,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "xpress": XPressArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
+    "pmtp": PMTPArgs,
 }
 
 
@@ -632,6 +642,7 @@ _GROUPS: dict[str, type[_Group]] = {
 # the validated recipe and match the model's own fallback loss; everything absent
 # falls back to the generic default below.
 _DEFAULT_LOSS_FN: dict[str, str] = {
+    "pmtp": "ce",
     "dflash": "ce",
     "xpress": '{"ce": 0.1, "tv": 0.9}',
 }
@@ -716,7 +727,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp, pmtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -746,6 +757,7 @@ class TrainConfig(BaseSettings):
     xpress: XPressArgs = Field(default_factory=XPressArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
+    pmtp: PMTPArgs = Field(default_factory=PMTPArgs)
 
     @model_validator(mode="after")
     def _resolve_derived_defaults(self) -> "TrainConfig":
@@ -822,6 +834,15 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pmtp(self) -> "TrainConfig":
+        if self.speculator_type == "pmtp":
+            if self.loss.loss_fn != "ce":
+                raise ValueError("Experimental PMTP currently requires --loss-fn=ce")
+            if self.mtp.num_speculative_steps < 1 or self.mtp.step_weight_beta <= 0:
+                raise ValueError("PMTP steps and step_weight_beta must be positive")
         return self
 
     def flatten(self) -> dict[str, Any]:

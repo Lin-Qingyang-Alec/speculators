@@ -514,10 +514,12 @@ def build_draft_model(
                 d2t=d2t,
                 verifier_name_or_path=args.verifier_name_or_path,
                 draft_attn_impl=(
-                    args.draft_attn_impl if args.speculator_type != "mtp" else None
+                    args.draft_attn_impl
+                    if args.speculator_type not in {"mtp", "pmtp"}
+                    else None
                 ),
             )
-        if args.speculator_type != "mtp":
+        if args.speculator_type not in {"mtp", "pmtp"}:
             # _attn_implementation is never serialized by HF configs, so re-apply
             # the CLI selection before construction -- mirroring from_training_args.
             # MTP is skipped: its from_training_args never sets the field and its
@@ -538,7 +540,7 @@ def build_draft_model(
             verifier=args.verifier_name_or_path,
         )
 
-    if args.speculator_type == "mtp":
+    if args.speculator_type in {"mtp", "pmtp"}:
         # MTP uses the verifier's own decoder config as the draft
         # transformer_layer_config and extracts the native MTP head weights from
         # the verifier; the decoder-shaping flags and --draft-config do not apply,
@@ -635,10 +637,10 @@ def main(cfg: TrainConfig):  # noqa: C901
 
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
-    if args.speculator_type == "mtp":
+    if cfg.speculator_type in {"mtp", "pmtp"}:
         if args.draft_attn_impl != "simple_flex_attention":
             raise ValueError(
-                "--draft-attn-impl is not configurable for MTP. "
+                "--draft-attn-impl is not configurable for MTP/PMTP. "
                 "Must be left with the default value ('simple_flex_attention')."
             )
         # MTP reuses the verifier's own decoder as the draft and extracts the
@@ -671,7 +673,7 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
 
-    if args.speculator_type == "mtp":
+    if cfg.speculator_type in {"mtp", "pmtp"}:
         args.num_speculative_steps = draft_model.config.num_speculative_steps
 
     # Dry-run: persist an initialized checkpoint and exit before training so the
@@ -702,6 +704,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         "eagle3": shift_batch,
         "peagle": shift_batch,
         "mtp": shift_batch_mtp,
+        "pmtp": shift_batch_mtp,
     }
     preprocess = preprocess_fns.get(args.speculator_type)
 

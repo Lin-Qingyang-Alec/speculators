@@ -6,6 +6,7 @@ from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
+from .pmtp import PMTPDraftModel, PMTPSpeculatorConfig
 from .xpress import XPressDraftModel, XPressSpeculatorConfig
 
 __all__ = [
@@ -21,6 +22,8 @@ __all__ = [
     "MTPSpeculatorConfig",
     "PEagleDraftModel",
     "PEagleSpeculatorConfig",
+    "PMTPDraftModel",
+    "PMTPSpeculatorConfig",
     "XPressDraftModel",
     "XPressSpeculatorConfig",
 ]

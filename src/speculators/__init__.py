@@ -40,6 +40,8 @@ from .models import (
     MTPSpeculatorConfig,
     PEagleDraftModel,
     PEagleSpeculatorConfig,
+    PMTPDraftModel,
+    PMTPSpeculatorConfig,
     XPressDraftModel,
     XPressSpeculatorConfig,
 )
@@ -58,6 +60,8 @@ __all__ = [
     "MTPSpeculatorConfig",
     "PEagleDraftModel",
     "PEagleSpeculatorConfig",
+    "PMTPDraftModel",
+    "PMTPSpeculatorConfig",
     "SpeculatorModel",
     "SpeculatorModelConfig",
     "SpeculatorsConfig",

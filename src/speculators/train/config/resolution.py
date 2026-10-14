@@ -98,7 +98,8 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
     "dspark": frozenset({"dspark"}),
     "xpress": frozenset({"xpress"}),
     "peagle": frozenset({"peagle"}),
-    "mtp": frozenset({"mtp"}),
+    "mtp": frozenset({"mtp", "pmtp"}),
+    "pmtp": frozenset({"pmtp"}),
 }
 
 
@@ -334,11 +335,11 @@ def _validate_draft_init(cfg: TrainConfig, provided: set[str]) -> None:
             "over all other model-definition options, so these conflict with it",
         )
         return
-    if cfg.speculator_type == "mtp":
+    if cfg.speculator_type in {"mtp", "pmtp"}:
         _reject_conflicts(
             with_draft_config,
-            "--speculator-type mtp reuses the verifier's decoder config, so these "
-            "options do not apply",
+            f"--speculator-type {cfg.speculator_type} reuses the verifier's decoder "
+            "config, so these options do not apply",
         )
         return
     if cfg.draft.draft_config:

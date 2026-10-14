@@ -267,6 +267,14 @@ def stitch(
     output_path: Path,
 ) -> Path:
     """Stitch finetuned MTP weights back into a verifier checkpoint."""
+    config_path = finetuned_checkpoint / "config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("speculators_model_type") == "pmtp":
+            raise ValueError(
+                "PMTP requires a parallel proposer; "
+                "stitch-mtp only supports serial MTP."
+            )
     console.print(
         Panel(
             f"[bold]Finetuned:[/] {finetuned_checkpoint}\n"
