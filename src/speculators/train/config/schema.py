@@ -608,6 +608,12 @@ class MTPArgs(_Group):
 
 
 class PMTPArgs(_Group):
+    pmtp_hidden_init: Literal["projection", "shared"] = Field(
+        default="projection",
+        description="PMTP future hidden inputs: per-step linear projection of the "
+        "verifier anchor (projection), or a learned shared placeholder (shared). "
+        "Saved checkpoint configuration takes precedence when resuming.",
+    )
     pmtp_max_anchors: int = Field(
         default=32, ge=1, description="Maximum parallel MTP groups per packed sequence."
     )

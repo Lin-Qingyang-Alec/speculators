@@ -1,12 +1,13 @@
 """One-pass, causal parallel MTP prototype (text-only, no serving KV cache).
 
 Base row i combines h[i] with embedding(x[i+1]) and predicts x[i+2].
-For a sampled anchor a, additional rows use learned placeholder inputs to
+For a sampled anchor a, additional rows use projected anchor hidden states
+or a shared learned hidden placeholder, plus a shared token placeholder, to
 predict x[a+3:a+K+2]. They see base rows <= a and earlier rows in their own
 group. In particular, they never see the teacher's future hidden states.
 """
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -28,8 +29,33 @@ class PMTPDraftModel(MTPDraftModel):
         # The dense custom mask below is implemented for SDPA only.
         config.transformer_layer_config._attn_implementation = "sdpa"  # noqa: SLF001
         super().__init__(config)
-        self.mask_hidden = nn.Parameter(torch.randn(1, 1, config.hidden_size) * 0.02)
+        self.mask_hidden: nn.Parameter | None = None
+        self.h_proj: nn.Linear | None = None
+        if config.pmtp_hidden_init == "shared":
+            self.mask_hidden = nn.Parameter(
+                torch.randn(1, 1, config.hidden_size) * 0.02
+            )
+        elif config.num_speculative_steps > 1:
+            self.h_proj = nn.Linear(
+                config.hidden_size,
+                (config.num_speculative_steps - 1) * config.hidden_size,
+            )
         self.mask_embedding = nn.Parameter(torch.randn(1, 1, config.hidden_size) * 0.02)
+
+    def _future_hidden(
+        self, hidden_states: torch.Tensor, anchors: torch.Tensor
+    ) -> torch.Tensor:
+        """Build future inputs using only each group's verifier anchor state."""
+        num_future = anchors.numel() * (self.config.num_speculative_steps - 1)
+        if self.h_proj is not None:
+            # Each H-wide output slice has its own weights and bias. No residual,
+            # future teacher features, or first-step MTP outputs enter this path.
+            projected = self.h_proj(hidden_states[0, anchors])
+            return projected.reshape(1, num_future, hidden_states.shape[-1])
+        if self.mask_hidden is not None:
+            return self.mask_hidden.expand(1, num_future, -1)
+        # Projection mode with K=1 has no future inputs or projection parameters.
+        return hidden_states[:, :0]
 
     def _block_features(
         self,
@@ -68,7 +94,7 @@ class PMTPDraftModel(MTPDraftModel):
         mask.masked_fill_(~allowed, float("-inf"))
         num_future = future_depth.numel()
         hidden = torch.cat(
-            (hidden_states[:, :n], self.mask_hidden.expand(1, num_future, -1)), dim=1
+            (hidden_states[:, :n], self._future_hidden(hidden_states, anchors)), dim=1
         )
         embeddings = torch.cat(
             (
@@ -193,7 +219,9 @@ class PMTPDraftModel(MTPDraftModel):
         per_step = token_losses.sum(0) / valid.sum(0).clamp(min=1)
         loss = (per_step * weights).sum()
         # Keep the placeholders connected even for K=1 / entirely empty batches.
-        loss = loss + 0 * (self.mask_hidden.sum() + self.mask_embedding.sum())
+        loss = loss + 0 * self.mask_embedding.sum()
+        if self.mask_hidden is not None:
+            loss = loss + 0 * self.mask_hidden.sum()
         correct = (predicted == labels) & valid
         metrics = {"loss_sum": loss.detach(), "loss_total": loss.new_tensor(1)}
         for step in range(k):
@@ -238,6 +266,7 @@ class PMTPDraftModel(MTPDraftModel):
         *,
         num_speculative_steps: int = 3,
         verifier_name_or_path: str | None = None,
+        pmtp_hidden_init: Literal["projection", "shared"] = "projection",
         pmtp_max_anchors: int = 32,
         pmtp_logit_chunk_size: int = 16,
         **kwargs: Any,  # noqa: ARG003
@@ -246,6 +275,7 @@ class PMTPDraftModel(MTPDraftModel):
             raise ValueError("PMTP requires a verifier with native MTP weights")
         config = PMTPSpeculatorConfig(
             transformer_layer_config=verifier_config,
+            pmtp_hidden_init=pmtp_hidden_init,
             pmtp_max_anchors=pmtp_max_anchors,
             pmtp_logit_chunk_size=pmtp_logit_chunk_size,
             speculators_config=SpeculatorsConfig(

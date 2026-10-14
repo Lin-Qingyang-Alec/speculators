@@ -74,6 +74,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPU" "$TRAIN_PYTHON" -m speculators.train \
     --vllm-endpoint "http://localhost:$PORT/v1" \
     --hidden-states-path "$HIDDEN_STATES" --on-missing generate \
     --num-speculative-steps 4 --step-weight-beta 0.6 \
+    --pmtp-hidden-init "${HIDDEN_INIT:-projection}" \
     --pmtp-max-anchors "${MAX_ANCHORS:-32}" --pmtp-logit-chunk-size 16 \
     --loss-fn ce --total-seq-len "$SEQ_LENGTH" \
     --epochs "${EPOCHS:-1}" --max-steps "${MAX_STEPS:-50}" \

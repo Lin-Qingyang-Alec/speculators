@@ -23,7 +23,7 @@ from speculators.train.config import TrainConfig
 from speculators.train.data import CollateFn
 
 
-def make_model(model_type="qwen3", steps=4):
+def make_model(model_type="qwen3", steps=4, hidden_init="projection"):
     torch.manual_seed(42)
     rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
     if model_type == "qwen3_5_moe_text":
@@ -46,6 +46,7 @@ def make_model(model_type="qwen3", steps=4):
     )
     config = PMTPSpeculatorConfig(
         transformer_layer_config=decoder,
+        pmtp_hidden_init=hidden_init,
         pmtp_max_anchors=3,
         pmtp_logit_chunk_size=2,
         speculators_config=SpeculatorsConfig(
@@ -73,8 +74,9 @@ def inputs(length=10):
 
 
 @pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5_moe_text"])
-def test_one_decoder_call_and_placeholder_gradients(model_type):
-    model = make_model(model_type).train()
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_one_decoder_call_and_future_input_gradients(model_type, hidden_init):
+    model = make_model(model_type, hidden_init=hidden_init).train()
     ids, hidden = inputs()
     calls = []
     hook = model.mtp_layers[0].register_forward_hook(lambda *args: calls.append(1))
@@ -84,7 +86,17 @@ def test_one_decoder_call_and_placeholder_gradients(model_type):
     assert len(calls) == 1
     assert predicted.shape == (3, 4)
     assert torch.isfinite(loss)
-    assert model.mask_hidden.grad.abs().sum() > 0
+    if hidden_init == "projection":
+        assert model.h_proj is not None
+        assert model.mask_hidden is None
+        # Every horizon must receive a training signal, not just the first slice.
+        grad = model.h_proj.weight.grad.reshape(3, 32, 32)
+        assert (grad.abs().sum(dim=(1, 2)) > 0).all()
+        assert model.h_proj.bias.grad.abs().sum() > 0
+    else:
+        assert model.h_proj is None
+        assert model.mask_hidden is not None
+        assert model.mask_hidden.grad.abs().sum() > 0
     assert model.mask_embedding.grad.abs().sum() > 0
     assert model.mtp_layers[0].input_proj.weight.grad.abs().sum() > 0
     assert model.embed_tokens.weight.grad is None
@@ -93,8 +105,9 @@ def test_one_decoder_call_and_placeholder_gradients(model_type):
 
 
 @pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5_moe_text"])
-def test_no_future_leakage_and_prefix_inference_parity(model_type):
-    model = make_model(model_type)
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_no_future_leakage_and_prefix_inference_parity(model_type, hidden_init):
+    model = make_model(model_type, hidden_init=hidden_init)
     ids, hidden = inputs()
     positions = torch.arange(ids.shape[1])[None]
     docs = torch.zeros_like(ids)
@@ -113,8 +126,9 @@ def test_no_future_leakage_and_prefix_inference_parity(model_type):
         torch.testing.assert_close(features[:1], changed[:1], atol=1e-6, rtol=1e-5)
 
 
-def test_packed_documents_and_padding_cannot_leak():
-    model = make_model()
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_packed_documents_and_padding_cannot_leak(hidden_init):
+    model = make_model(hidden_init=hidden_init)
     ids, hidden = inputs(12)
     docs = torch.tensor([[0] * 5 + [1] * 5 + [-1] * 2])
     positions = torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 0]])
@@ -150,22 +164,38 @@ def test_targets_shift_two_tokens_and_do_not_cross_documents():
 
 
 @pytest.mark.parametrize("steps", [1, 4])
-def test_empty_packed_batch_has_finite_connected_zero_loss(steps):
-    model = make_model(steps=steps).train()
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_empty_packed_batch_has_finite_connected_zero_loss(steps, hidden_init):
+    model = make_model(steps=steps, hidden_init=hidden_init).train()
     batch = CollateFn(8, 32, 1, torch.float32, shift_batch_mtp)([])
     _, loss, _ = model(**batch)
     assert loss.item() == 0
     loss.backward()
-    assert torch.isfinite(model.mask_hidden.grad).all()
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+            assert torch.count_nonzero(parameter.grad) == 0
     assert model.mtp_layers[0].input_proj.weight.grad is not None
 
 
-def test_checkpoint_roundtrip_and_stitch_rejection(tmp_path, monkeypatch):
-    model = make_model()
+@pytest.mark.parametrize("hidden_init", ["projection", "shared", "legacy"])
+@pytest.mark.parametrize("steps", [1, 4])
+def test_checkpoint_roundtrip_and_stitch_rejection(
+    tmp_path, monkeypatch, hidden_init, steps
+):
+    mode = "shared" if hidden_init == "legacy" else hidden_init
+    model = make_model(steps=steps, hidden_init=mode)
     model.save_pretrained(tmp_path)
+    if hidden_init == "legacy":
+        config_path = tmp_path / "config.json"
+        saved = json.loads(config_path.read_text())
+        saved.pop("pmtp_hidden_init")
+        config_path.write_text(json.dumps(saved), encoding="utf-8")
     config = SpeculatorModelConfig.from_pretrained(tmp_path)
     assert isinstance(config, PMTPSpeculatorConfig)
-    assert config.num_speculative_steps == 4
+    assert config.num_speculative_steps == steps
+    assert config.pmtp_hidden_init == mode
     assert SpeculatorModel.registry is not None
     assert SpeculatorModel.registry["pmtp"] is PMTPDraftModel
 
@@ -180,7 +210,13 @@ def test_checkpoint_roundtrip_and_stitch_rejection(tmp_path, monkeypatch):
     monkeypatch.setattr(PMTPDraftModel, "load_verifier_weights", load_frozen)
     restored = PMTPDraftModel.from_pretrained(tmp_path)
     assert isinstance(restored, PMTPDraftModel)
-    torch.testing.assert_close(restored.mask_hidden, model.mask_hidden)
+    assert restored.config.pmtp_hidden_init == mode
+    if model.mask_hidden is not None:
+        torch.testing.assert_close(restored.mask_hidden, model.mask_hidden)
+    if model.h_proj is not None:
+        assert restored.h_proj is not None
+        torch.testing.assert_close(restored.h_proj.weight, model.h_proj.weight)
+        torch.testing.assert_close(restored.h_proj.bias, model.h_proj.bias)
     torch.testing.assert_close(restored.mask_embedding, model.mask_embedding)
     ids, hidden = inputs(5)
     torch.testing.assert_close(
@@ -196,13 +232,15 @@ def test_checkpoint_roundtrip_and_stitch_rejection(tmp_path, monkeypatch):
     )
 
 
-def test_training_config_roundtrip_and_invalid_options(tmp_path):
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_training_config_roundtrip_and_invalid_options(tmp_path, hidden_init):
     cfg = TrainConfig.from_sources(
         cli={
             "verifier_name_or_path": "dummy-verifier",
             "speculator_type": "pmtp",
             "num_speculative_steps": 4,
             "pmtp_max_anchors": 7,
+            "pmtp_hidden_init": hidden_init,
         },
         argv=[],
     )
@@ -212,6 +250,17 @@ def test_training_config_roundtrip_and_invalid_options(tmp_path):
     loaded = TrainConfig.from_sources(cli={}, config_path=str(path), argv=[])
     assert loaded.pmtp.pmtp_max_anchors == 7
     assert loaded.mtp.num_speculative_steps == 4
+    assert loaded.pmtp.pmtp_hidden_init == hidden_init
+    assert loaded.flatten()["pmtp_hidden_init"] == hidden_init
+    override = "shared" if hidden_init == "projection" else "projection"
+    cli_loaded = TrainConfig.resolve(
+        ["--config", str(path), "--pmtp-hidden-init", override]
+    )
+    assert cli_loaded.pmtp.pmtp_hidden_init == override
+    default = TrainConfig.from_flat({"speculator_type": "pmtp"})
+    assert default.pmtp.pmtp_hidden_init == "projection"
+    with pytest.raises(ValueError, match="pmtp_hidden_init"):
+        TrainConfig.from_flat({"speculator_type": "pmtp", "pmtp_hidden_init": "gru"})
     with pytest.raises(ValueError, match="loss-fn=ce"):
         TrainConfig.from_flat({"speculator_type": "pmtp", "loss_fn": "kl_div"})
     with pytest.raises(ValueError, match="decoder config"):
@@ -220,7 +269,8 @@ def test_training_config_roundtrip_and_invalid_options(tmp_path):
         )
 
 
-def test_native_initialization_preserves_all_mtp_weights(monkeypatch):
+@pytest.mark.parametrize("hidden_init", ["projection", "shared"])
+def test_native_initialization_preserves_all_mtp_weights(monkeypatch, hidden_init):
     native = make_model("qwen3_5_moe_text")
     state = {
         name: value.clone()
@@ -238,7 +288,9 @@ def test_native_initialization_preserves_all_mtp_weights(monkeypatch):
         native.config.transformer_layer_config,
         verifier_name_or_path="dummy-verifier",
         num_speculative_steps=4,
+        pmtp_hidden_init=hidden_init,
     )
+    assert restored.config.pmtp_hidden_init == hidden_init
     for name, value in state.items():
         torch.testing.assert_close(restored.state_dict()[name], value)
     state.pop(next(iter(state)))
@@ -265,3 +317,51 @@ def test_logit_chunks_bound_head_size_and_preserve_loss():
     model.config.pmtp_logit_chunk_size = 100
     _, unchunked, _ = model(ids, hidden)
     torch.testing.assert_close(chunked, unchunked)
+
+
+def test_projection_uses_each_anchor_with_distinct_horizons_and_no_residual():
+    model = make_model()
+    assert model.h_proj is not None
+    with torch.no_grad():
+        # A zero first slice detects an accidental h_anchor residual. Other
+        # slices distinguish horizon order and anchor order in the decoder input.
+        model.h_proj.weight.copy_(torch.cat([torch.eye(32) * i for i in range(3)]))
+        model.h_proj.bias.zero_()
+    ids, hidden = inputs()
+    positions = torch.arange(ids.shape[1])[None]
+    anchors = torch.tensor([2, 5])
+    captured = []
+
+    def capture(module, args, kwargs):
+        captured.append(kwargs["hidden_states"].detach().clone())
+
+    hook = model.mtp_layers[0].register_forward_pre_hook(capture, with_kwargs=True)
+    with torch.no_grad():
+        model._block_features(ids, hidden, positions, torch.zeros_like(ids), anchors)
+    hook.remove()
+    assert len(captured) == 1
+    n = ids.shape[1] - 1
+    torch.testing.assert_close(captured[0][:, :n], hidden[:, :n])
+    future = captured[0][0, n:].reshape(2, 3, 32)
+    torch.testing.assert_close(future[:, 0], torch.zeros_like(hidden[0, anchors]))
+    torch.testing.assert_close(future[:, 1], hidden[0, anchors])
+    torch.testing.assert_close(future[:, 2], 2 * hidden[0, anchors])
+    changed = hidden.clone()
+    changed[:, 2] += 1
+    with torch.no_grad():
+        updated = model._future_hidden(changed, anchors).reshape(2, 3, 32)
+    assert not torch.equal(updated[0], future[0])
+    torch.testing.assert_close(updated[1], future[1])
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5_moe_text"])
+def test_single_step_projection_has_no_unused_future_parameters(model_type):
+    model = make_model(model_type, steps=1).train()
+    assert model.h_proj is None
+    assert model.mask_hidden is None
+    ids, hidden = inputs()
+    predicted, loss, _ = model(ids, hidden)
+    loss.backward()
+    assert predicted.shape == (3, 1)
+    assert torch.isfinite(loss)
+    assert model.mtp_layers[0].input_proj.weight.grad.abs().sum() > 0
